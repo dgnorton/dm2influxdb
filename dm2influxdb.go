@@ -7,14 +7,17 @@ import (
 	influx "github.com/influxdb/influxdb/client"
 	"log"
 	"os/user"
+	"strings"
 )
 
 func main() {
 	// parse command line options
 	var dmUser string
 	var maxRecords int
+	var workoutTypes string
 	flag.StringVar(&dmUser, "u", "", "dailymile username")
 	flag.IntVar(&maxRecords, "m", -1, "max number of records to insert into database")
+	flag.StringVar(&workoutTypes, "t", "", "dailymile workout types (comma delimited string)")
 	flag.Parse()
 	if dmUser == "" {
 		flag.Usage()
@@ -50,13 +53,13 @@ func main() {
 	_, err = client.Query(fmt.Sprintf("drop series %s.pace", dmUser))
 	fatalIfErr(err)
 
-	series, err := entries2Series(dmUser, entries, maxRecords)
+	series, err := entries2Series(dmUser, entries, maxRecords, workoutTypes)
 	fatalIfErr(err)
 	err = client.WriteSeriesWithTimePrecision(series, influx.Second)
 	fatalIfErr(err)
 }
 
-func entries2Series(dmUser string, entries *dmapi.Entries, maxRecords int) ([]*influx.Series, error) {
+func entries2Series(dmUser string, entries *dmapi.Entries, maxRecords int, workoutTypes string) ([]*influx.Series, error) {
 	distanceSeries := &influx.Series{
 		Name:    fmt.Sprintf("%s.distance", dmUser),
 		Columns: []string{"time", "distance"},
@@ -78,10 +81,13 @@ func entries2Series(dmUser string, entries *dmapi.Entries, maxRecords int) ([]*i
 	recordCnt := 0
 	for _, entry := range entries.Entries {
 		if entry.Workout.Type == "" {
-			continue
+			continue	// skip non-workout entries
+		}
+		if workoutTypes != "" && !strings.Contains(workoutTypes, entry.Workout.Type) {
+			continue	// skip entry because it's not a type we want
 		}
 		if maxRecords > -1 && recordCnt >= maxRecords {
-			break
+			break		// we've reached the maxRecords limit
 		}
 		recordCnt++
 		tm, err := entry.Time()
