@@ -3,18 +3,22 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/dgnorton/dmapi"
-	influx "github.com/influxdb/influxdb/client"
 	"log"
+	"net/url"
 	"os/user"
 	"strings"
+
+	"github.com/dgnorton/dmapi"
+	influx "github.com/influxdb/influxdb/client"
 )
 
 func main() {
 	// parse command line options
+	var database string
 	var dmUser string
 	var maxRecords int
 	var workoutTypes string
+	flag.StringVar(&database, "d", "dailymile", "database name")
 	flag.StringVar(&dmUser, "u", "", "dailymile username")
 	flag.IntVar(&maxRecords, "m", -1, "max number of records to insert into database")
 	flag.StringVar(&workoutTypes, "t", "", "dailymile workout types (comma delimited string)")
@@ -32,62 +36,56 @@ func main() {
 	fatalIfErr(err)
 
 	// create dailymile database in InfluxDB, if it doesn't exist
-	cfg := &influx.ClientConfig{Username: "root", Password: "root", Database: "dailymile"}
+	url, _ := url.Parse("http://localhost:8086")
+	cfg := influx.Config{URL: *url}
 	client, err := influx.NewClient(cfg)
 	fatalIfErr(err)
-	dbList, err := client.GetDatabaseList()
+	fatalIfErr(createDBIfNotExists(client, database))
+
+	points, err := entries2Points(dmUser, entries, maxRecords, workoutTypes)
 	fatalIfErr(err)
-	if !dbExists(cfg.Database, dbList) {
-		fmt.Printf("Creating database: %s\n", cfg.Database)
-		err = client.CreateDatabase(cfg.Database)
-		fatalIfErr(err)
-	} else {
-		fmt.Printf("Database already exists: %s\n", cfg.Database)
+	bps := influx.BatchPoints{
+		Points:          points,
+		Database:        database,
+		RetentionPolicy: "default",
 	}
 
-	// drop existing series for user if it already exists
-	_, err = client.Query(fmt.Sprintf("drop series %s.distance", dmUser))
-	fatalIfErr(err)
-	_, err = client.Query(fmt.Sprintf("drop series %s.duration", dmUser))
-	fatalIfErr(err)
-	_, err = client.Query(fmt.Sprintf("drop series %s.pace", dmUser))
-	fatalIfErr(err)
-
-	series, err := entries2Series(dmUser, entries, maxRecords, workoutTypes)
-	fatalIfErr(err)
-	err = client.WriteSeriesWithTimePrecision(series, influx.Second)
+	_, err = client.Write(bps)
 	fatalIfErr(err)
 }
 
-func entries2Series(dmUser string, entries *dmapi.Entries, maxRecords int, workoutTypes string) ([]*influx.Series, error) {
-	distanceSeries := &influx.Series{
-		Name:    fmt.Sprintf("%s.distance", dmUser),
-		Columns: []string{"time", "distance"},
-		Points:  [][]interface{}{},
+// queryDB convenience function to query the database
+func queryDB(c *influx.Client, cmd, db string) (res []influx.Result, err error) {
+	q := influx.Query{
+		Command:  cmd,
+		Database: db,
 	}
-
-	durationSeries := &influx.Series{
-		Name:    fmt.Sprintf("%s.duration", dmUser),
-		Columns: []string{"time", "duration"},
-		Points:  [][]interface{}{},
+	if response, err := c.Query(q); err == nil {
+		if response.Error() != nil {
+			return res, response.Error()
+		}
+		res = response.Results
 	}
+	return
+}
 
-	paceSeries := &influx.Series{
-		Name:    fmt.Sprintf("%s.pace", dmUser),
-		Columns: []string{"time", "pace", "paceStr"},
-		Points:  [][]interface{}{},
-	}
+func createDBIfNotExists(c *influx.Client, name string) error {
+	_, err := queryDB(c, "CREATE DATABASE IF NOT EXISTS "+name, "")
+	return err
+}
 
+func entries2Points(dmUser string, entries *dmapi.Entries, maxRecords int, workoutTypes string) ([]influx.Point, error) {
 	recordCnt := 0
+	points := []influx.Point{}
 	for _, entry := range entries.Entries {
 		if entry.Workout.Type == "" {
-			continue	// skip non-workout entries
+			continue // skip non-workout entries
 		}
 		if workoutTypes != "" && !strings.Contains(workoutTypes, entry.Workout.Type) {
-			continue	// skip entry because it's not a type we want
+			continue // skip entry because it's not a type we want
 		}
 		if maxRecords > -1 && recordCnt >= maxRecords {
-			break		// we've reached the maxRecords limit
+			break // we've reached the maxRecords limit
 		}
 		recordCnt++
 		tm, err := entry.Time()
@@ -95,37 +93,39 @@ func entries2Series(dmUser string, entries *dmapi.Entries, maxRecords int, worko
 			return nil, err
 		}
 		distance := entry.Workout.Distance.Value
-		point := []interface{}{float64(tm.Unix()), distance}
-		distanceSeries.Points = append(distanceSeries.Points, point)
-
 		duration := entry.Workout.Duration().Seconds() / 60
-		point = []interface{}{float64(tm.Unix()), duration}
-		durationSeries.Points = append(durationSeries.Points, point)
 
+		pace := 0.0
+		paceStr := ""
 		if distance > 0 && duration > 0 {
 			p, err := entry.Workout.Pace()
 			if err != nil {
 				fmt.Println("pace error")
 				continue
 			}
-			paceStr := dmapi.DurationStr(p)
-			pace := p.Seconds() / 60
-
-			point = []interface{}{float64(tm.Unix()), pace, paceStr}
-			paceSeries.Points = append(paceSeries.Points, point)
+			paceStr = dmapi.DurationStr(p)
+			pace = p.Seconds() / 60
 		}
+		point := influx.Point{
+			Measurement: "workout",
+			Tags: map[string]string{
+				"user": dmUser,
+				"type": entry.Workout.Type,
+			},
+			Fields: map[string]interface{}{
+				"distance": distance,
+				"duration": duration,
+				"pace":     pace,
+				"pace_str": paceStr,
+			},
+			Time:      tm,
+			Precision: "s",
+		}
+		points = append(points, point)
 	}
-	return []*influx.Series{distanceSeries, durationSeries, paceSeries}, nil
+	return points, nil
 }
 
-func dbExists(dbname string, dbList []map[string]interface{}) bool {
-	for _, db := range dbList {
-		if dbname == db["name"] {
-			return true
-		}
-	}
-	return false
-}
 func fatalIfErr(err error) {
 	if err != nil {
 		log.Fatalln(err)
